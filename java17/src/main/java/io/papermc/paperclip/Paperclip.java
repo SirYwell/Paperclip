@@ -8,14 +8,18 @@ import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
 import java.net.URL;
-import java.net.URLClassLoader;
 import java.nio.file.FileSystem;
 import java.nio.file.FileSystems;
 import java.nio.file.Path;
-import java.util.Arrays;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.Map;
+
+import io.papermc.paperclip.index.Index;
+import io.papermc.paperclip.index.IndexedClassLoader;
+import io.papermc.paperclip.index.Indexer;
 
 public final class Paperclip {
 
@@ -25,10 +29,7 @@ public final class Paperclip {
             System.exit(1);
         }
 
-        final URL[] classpathUrls = setupClasspath();
-
-        final ClassLoader parentClassLoader = Paperclip.class.getClassLoader().getParent();
-        final URLClassLoader classLoader = new URLClassLoader(classpathUrls, parentClassLoader);
+        final ClassLoader classLoader = setupClassLoader();
 
         final String mainClassName = findMainClass();
         System.out.println("Starting " + mainClassName);
@@ -48,7 +49,21 @@ public final class Paperclip {
         runThread.start();
     }
 
-    private static URL[] setupClasspath() {
+    private static ClassLoader setupClassLoader() {
+        MessageDigest messageDigest;
+        try {
+            messageDigest = MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException e) {
+            throw Util.sneakyThrow(e);
+        }
+        final URL[] classpathUrls = setupClasspath(messageDigest);
+        Index index = Indexer.createIndex(messageDigest.digest(), classpathUrls);
+
+        final ClassLoader parentClassLoader = Paperclip.class.getClassLoader().getParent();
+        return new IndexedClassLoader("Paper", index, classpathUrls, parentClassLoader);
+    }
+
+    private static URL[] setupClasspath(MessageDigest digest) {
         final var repoDir = Path.of(System.getProperty("bundlerRepoDir", ""));
 
         final PatchEntry[] patches = findPatches();
@@ -69,7 +84,7 @@ public final class Paperclip {
             baseFile = null;
         }
 
-        final Map<String, Map<String, URL>> classpathUrls = extractAndApplyPatches(baseFile, patches, repoDir);
+        final Map<String, Map<String, URL>> classpathUrls = extractAndApplyPatches(baseFile, patches, repoDir, digest);
 
         // Exit if user has set `paperclip.patchonly` system property to `true`
         if (Boolean.getBoolean("paperclip.patchonly")) {
@@ -144,13 +159,14 @@ public final class Paperclip {
         }
     }
 
-    private static Map<String, Map<String, URL>> extractAndApplyPatches(final Path originalJar, final PatchEntry[] patches, final Path repoDir) {
+    private static Map<String, Map<String, URL>> extractAndApplyPatches(final Path originalJar, final PatchEntry[] patches, final Path repoDir,
+            MessageDigest digest) {
         if (originalJar == null && patches.length > 0) {
             throw new IllegalArgumentException("Patch data found without patch target");
         }
 
         // First extract any non-patch files
-        final Map<String, Map<String, URL>> urls = extractFiles(patches, originalJar, repoDir);
+        final Map<String, Map<String, URL>> urls = extractFiles(patches, originalJar, repoDir, digest);
 
         // Next apply any patches that we have
         applyPatches(urls, patches, originalJar, repoDir);
@@ -158,7 +174,8 @@ public final class Paperclip {
         return urls;
     }
 
-    private static Map<String, Map<String, URL>> extractFiles(final PatchEntry[] patches, final Path originalJar, final Path repoDir) {
+    private static Map<String, Map<String, URL>> extractFiles(final PatchEntry[] patches, final Path originalJar, final Path repoDir,
+            MessageDigest digest) {
         final var urls = new HashMap<String, Map<String, URL>>();
 
         try {
@@ -180,12 +197,12 @@ public final class Paperclip {
                 final var versionsMap = new HashMap<String, URL>();
                 urls.putIfAbsent("versions", versionsMap);
                 final FileEntry[] versionEntries = findVersionEntries();
-                extractEntries(versionsMap, patches, originalRootDir, repoDir, versionEntries, "versions");
+                extractEntries(versionsMap, patches, originalRootDir, repoDir, versionEntries, "versions", digest);
 
                 final FileEntry[] libraryEntries = findLibraryEntries();
                 final var librariesMap = new HashMap<String, URL>();
                 urls.putIfAbsent("libraries", librariesMap);
-                extractEntries(librariesMap, patches, originalRootDir, repoDir, libraryEntries, "libraries");
+                extractEntries(librariesMap, patches, originalRootDir, repoDir, libraryEntries, "libraries", digest);
             } finally {
                 if (originalJarFs != null) {
                     originalJarFs.close();
@@ -204,7 +221,8 @@ public final class Paperclip {
         final Path originalRootDir,
         final Path repoDir,
         final FileEntry[] entries,
-        final String targetName
+        final String targetName,
+        final MessageDigest digest
     ) throws IOException {
         if (entries == null) {
             return;
@@ -215,6 +233,7 @@ public final class Paperclip {
 
         for (final FileEntry entry : entries) {
             entry.extractFile(urls, patches, targetName, originalRootDir, targetPath, targetDir);
+            digest.update(entry.hash());
         }
     }
 
